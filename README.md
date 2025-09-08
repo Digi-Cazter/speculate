@@ -191,7 +191,7 @@ Each scenario prints:
 - Accuracy bar + threshold info.
 - Suite summary at the bottom.
 
-![Speculate Screenshot](./screenshot.png)
+![Speculate Screenshot](https://github.com/Digi-Cazter/speculate/blob/main/screenshot.png)
 
 ---
 

@@ -12,6 +12,8 @@ from rich.panel import Panel
 from rich.text import Text
 from rich import box
 
+from .expectations import ExpectationMixin  # added
+
 # Rich console
 console = Console(highlight=False)
 
@@ -97,7 +99,7 @@ def _threshold_badge(thr: Optional[float], acc: float) -> Text:
 # ──────────────────────────────────────────────────────────────────────────────
 # Scenario
 # ──────────────────────────────────────────────────────────────────────────────
-class Scenario:
+class Scenario(ExpectationMixin):  # was: class Scenario:
     """
     BDD-like scenario runner with:
       - expectation helpers (exact/contains/regex/schema)
@@ -123,6 +125,7 @@ class Scenario:
         # Step builder state
         self._steps: List[Dict[str, Any]] = []  # each: {"prompt": str, "kind": ..., ...}
         self._prompt_text: Optional[str] = None
+        self._random_prompt_choices: Optional[List[str]] = None  # added
 
         # Expectations (for the *current* step being built)
         self._expect_kind: Optional[str] = None
@@ -165,6 +168,18 @@ class Scenario:
         """Start a new step. If a previous step was in progress, finalize it."""
         self._finalize_pending_step()
         self._prompt_text = prompt_text
+        return self
+
+    def random_prompt(self, prompts: List[str]):
+        """
+        Define a step whose user prompt is randomly chosen from the provided list
+        for each run (and each time the step is executed).
+        Chain expectation methods after this just like with prompt().
+        """
+        self._finalize_pending_step()
+        if not prompts:
+            raise ValueError("random_prompt requires at least one prompt string")
+        self._random_prompt_choices = list(prompts)
         return self
 
     # ── Controls: seed, runs, accuracy, multi_shot ─────────────────────────────
@@ -214,48 +229,14 @@ class Scenario:
         self._raw_file_format = "json" if str(file_format).lower() == "json" else "txt"
         return self
 
-    # ── Expectations (apply to the *current* step) ─────────────────────────────
-    def expect_exact(self, expected: str):
-        self._expect_kind = "exact"
-        self._expect_value = expected
-        return self
-
-    def expect_contains(self, substring: str):
-        self._expect_kind = "contains"
-        self._expect_value = substring
-        return self
-    
-    def expect_not_equal(self, unexpected: str):
-        """Pass if the output is not exactly equal to the given string."""
-        self._expect_kind = "not_equal"
-        self._expect_value = unexpected
-        return self
-
-    def expect_not_contains(self, substring: str):
-        """Pass if the output does not contain the given substring."""
-        self._expect_kind = "not_contains"
-        self._expect_value = substring
-        return self
-
-    def expect_regex(self, pattern: str):
-        self._expect_kind = "regex"
-        self._expect_regex = re.compile(pattern, re.DOTALL)
-        return self
-
-    def expect_schema(self, model: Type[BaseModel], coerce_json: bool = True, **expected_fields):
-        self._expect_kind = "schema"
-        self._expect_model = model
-        self._expect_model_values = expected_fields
-        self._expect_coerce_json = coerce_json
-        return self
-
     # ── Internals: step building & validation ──────────────────────────────────
     def _finalize_pending_step(self):
         """Push the current in-progress step into the steps list."""
-        if self._prompt_text is None:
+        if self._prompt_text is None and self._random_prompt_choices is None:
             return
         step = {
             "prompt": self._prompt_text,
+            "prompt_choices": list(self._random_prompt_choices) if self._random_prompt_choices else None,  # added
             "kind": self._expect_kind,
             "value": self._expect_value,
             "regex": self._expect_regex,
@@ -267,6 +248,7 @@ class Scenario:
 
         # reset current step builder state
         self._prompt_text = None
+        self._random_prompt_choices = None  # added
         self._expect_kind = None
         self._expect_value = None
         self._expect_regex = None
@@ -307,11 +289,21 @@ class Scenario:
         try:
             parsed = model.model_validate(data)  # pydantic v2
         except ValidationError as ve:
-            return False, [
-                "Expected: JSON matching schema",
-                json.dumps(data, ensure_ascii=False, indent=2),
-                str(ve),
-            ]
+            # Extract missing field names (pydantic v2 error types: 'missing', 'field_required')
+            missing_fields: List[str] = []
+            for err in ve.errors():
+                if err.get("type") in ("missing", "missing_field", "field_required"):
+                    loc = err.get("loc")
+                    if isinstance(loc, (list, tuple)):
+                        missing_fields.append(".".join(str(p) for p in loc))
+                    elif loc:
+                        missing_fields.append(str(loc))
+            lines = ["Expected: JSON matching schema"]
+            if missing_fields:
+                lines.append("Missing fields: " + ", ".join(sorted(set(missing_fields))))
+            lines.append(json.dumps(data, ensure_ascii=False, indent=2))
+            lines.append(str(ve))
+            return False, lines
 
         mismatches: List[str] = []
         for k, expected_val in model_values.items():
@@ -339,6 +331,9 @@ class Scenario:
         last_output = ""
         for idx, spec in enumerate(steps, start=1):
             prompt = spec["prompt"]
+            choices = spec.get("prompt_choices")  # added
+            if choices:  # added
+                prompt = random.choice(choices)
             kind = spec["kind"]
             value = spec["value"]
             regex = spec["regex"]
@@ -426,7 +421,11 @@ class Scenario:
 
             # Show a concise prompt preview (first step)
             header.append("\nFirst prompt: ", style="cyan")
-            header.append(_truncate(steps_to_use[0]['prompt'], 120), style="white")
+            first_step = steps_to_use[0]  # added
+            if first_step.get("prompt_choices"):  # added
+                header.append(f"<random choice of {len(first_step['prompt_choices'])}>", style="white")
+            else:  # existing behavior
+                header.append(_truncate(first_step['prompt'], 120), style="white")
 
             # Seed info
             if self._randomize_seed:
@@ -483,11 +482,10 @@ class Scenario:
                 else:
                     first_line = fail_lines[0] if fail_lines else "(mismatch)"
                     prefix = f"Step {fail_step} failed: "
-                    details = Text(_truncate(prefix + first_line, 240), style="red")
-                    # keep sample for later context
-                    snippet = _truncate(out, 400)
-                    fail_examples.append(f"Step {fail_step}: {first_line}\n{snippet}")
-
+                    # Previously truncated; now show full line without ellipsis
+                    details = Text(prefix + first_line, style="red")
+                    # Store full output (no truncation)
+                    fail_examples.append(f"Step {fail_step}: {first_line}\n{out}")
                 table.add_row(str(i), badge, seed_text, details)
 
             console.print(table)
